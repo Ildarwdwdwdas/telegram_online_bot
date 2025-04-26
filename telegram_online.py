@@ -13,8 +13,8 @@ from colorama import Fore, Style, init
 from telethon import TelegramClient, events, functions, types, utils
 
 # API-ключи Telegram
-API_ID = 23392898
-API_HASH = "8bb33954756ad65e785b24a3db786386"
+API_ID = 
+API_HASH = ""
 
 # Инициализация colorama
 init()
