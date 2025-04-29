@@ -12,9 +12,10 @@ from logging.handlers import RotatingFileHandler
 from colorama import Fore, Style, init
 from telethon import TelegramClient, events, functions, types, utils
 
-# API-ключи Telegram
-API_ID = 
-API_HASH = ""
+# Импортируем конфигурацию и компоненты
+from config import API_ID, API_HASH, ONLINE_UPDATE_INTERVAL, ACCOUNTS_FILE, ADMIN_ID, IGNORED_USERS
+from database import db
+from notification_bot import notification_bot
 
 # Инициализация colorama
 init()
@@ -30,7 +31,8 @@ logger.setLevel(logging.INFO)
 file_handler = RotatingFileHandler(
     f'logs/telegram_online_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log',
     maxBytes=10 * 1024 * 1024,  # 10 МБ
-    backupCount=5
+    backupCount=5,
+    encoding='utf-8'  # Явное указание кодировки UTF-8
 )
 file_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)-7s | %(message)s', '%Y-%m-%d %H:%M:%S'))
 logger.addHandler(file_handler)
@@ -47,17 +49,12 @@ message_logger.setLevel(logging.INFO)
 # Файловый обработчик с ротацией файлов для сообщений
 message_file_handler = RotatingFileHandler(
     f'logs/messages_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log',
-    maxBytes=10 * 1024 * 1024,  # 10 МБ
-    backupCount=5
+    maxBytes=50 * 1024 * 1024,  # Увеличиваем до 50 МБ
+    backupCount=10,  # Увеличиваем число файлов для ротации
+    encoding='utf-8'  # Явное указание кодировки UTF-8
 )
 message_file_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)-7s | %(message)s', '%Y-%m-%d %H:%M:%S'))
 message_logger.addHandler(message_file_handler)
-
-# Интервал обновления статуса онлайн (в секундах)
-ONLINE_UPDATE_INTERVAL = 3
-
-# Путь к файлу с данными аккаунтов
-ACCOUNTS_FILE = 'telegram_accounts.json'
 
 class MultiAccountTelegramBot:
     def __init__(self, use_proxy=False):
@@ -67,13 +64,20 @@ class MultiAccountTelegramBot:
         self.is_running = True
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
+        self.notification_bot = None  # Инициализируем как None
         
     def load_accounts(self):
         """Загрузка данных аккаунтов из файла"""
         if os.path.exists(ACCOUNTS_FILE):
             try:
                 with open(ACCOUNTS_FILE, 'r') as f:
-                    return json.load(f)
+                    accounts = json.load(f)
+                    # Проверяем наличие всех необходимых полей
+                    for account in accounts:
+                        # Добавляем путь к файлу сессии, если его нет
+                        if 'session_file' not in account:
+                            account['session_file'] = f"sessions/{account['phone']}"
+                    return accounts
             except Exception as e:
                 logger.error(f"Ошибка загрузки аккаунтов: {e}")
                 return []
@@ -118,46 +122,146 @@ class MultiAccountTelegramBot:
         # Создаем клиента
         client = self.create_client(session_file)
         
-        # Если сессия существует, пробуем автоматический вход
-        if session_exists:
-            logger.info(f"{Fore.YELLOW}Попытка автоматического входа с номером: {phone}{Style.RESET_ALL}")
-            try:
-                await client.connect()
-                if not await client.is_user_authorized():
-                    await client.start(phone=lambda: phone)
-                logger.info(f"{Fore.GREEN}Авторизация для {phone} успешна!{Style.RESET_ALL}")
-            except Exception as e:
-                logger.error(f"{Fore.RED}Ошибка автоматического входа для {phone}: {e}{Style.RESET_ALL}")
-                # Если не получилось, пробуем ручной вход
-                try:
-                    await client.start(phone=lambda: input(f'{Fore.YELLOW}Введите номер телефона для {account_data["name"]}: {Style.RESET_ALL}'))
-                    logger.info(f"{Fore.GREEN}Вход выполнен вручную для {phone}{Style.RESET_ALL}")
-                    
-                    # Обновляем номер в данных аккаунта, если он был изменен
-                    actual_user = await client.get_me()
-                    if hasattr(actual_user, 'phone'):
-                        account_data['phone'] = actual_user.phone
-                        self.save_accounts()
-                except Exception as e2:
-                    logger.error(f"{Fore.RED}Не удалось войти для {phone}: {e2}{Style.RESET_ALL}")
-                    return None
-        else:
-            # Если сессии нет, запрашиваем номер телефона и код
-            try:
-                await client.start(phone=lambda: input(f'{Fore.YELLOW}Введите номер телефона для {account_data["name"]}: {Style.RESET_ALL}'))
-                logger.info(f"{Fore.GREEN}Новая авторизация успешна!{Style.RESET_ALL}")
-                
-                # Обновляем номер в данных аккаунта
-                actual_user = await client.get_me()
-                if hasattr(actual_user, 'phone'):
-                    account_data['phone'] = actual_user.phone
-                    self.save_accounts()
-                    logger.info(f"{Fore.GREEN}Номер телефона обновлен: {account_data['phone']}{Style.RESET_ALL}")
-            except Exception as e:
-                logger.error(f"{Fore.RED}Ошибка авторизации: {e}{Style.RESET_ALL}")
-                return None
+        # Если клиент не был создан, выходим
+        if not client:
+            logger.error(f"{Fore.RED}[{phone}] Не удалось создать клиента{Style.RESET_ALL}")
+            return
         
-        # Загружаем последние диалоги для кэширования сущностей
+        # Сохраняем клиента в словаре для возможного доступа извне
+        self.clients[phone] = client
+        
+        try:
+            # Запускаем клиента
+            await client.connect()
+            
+            # Если клиент не авторизован, выполняем авторизацию
+            if not await client.is_user_authorized():
+                result = await self.authenticate_account(client, account_data)
+                if not result:
+                    logger.error(f"{Fore.RED}[{phone}] Не удалось авторизовать аккаунт{Style.RESET_ALL}")
+                    return
+            
+            # Получаем информацию о пользователе
+            me = await client.get_me()
+            logger.info(f"{Fore.GREEN}[{phone}] Авторизован как {me.first_name} {me.last_name if me.last_name else ''} (@{me.username if me.username else 'без username'}){Style.RESET_ALL}")
+            
+            # Загружаем диалоги для кэширования
+            await self.cache_dialogs(client, phone)
+        except Exception as e:
+            logger.error(f"{Fore.RED}[{phone}] Ошибка при подключении клиента: {e}{Style.RESET_ALL}")
+            return
+        
+        logger.info(f"{Fore.GREEN}Клиент для {account_data['phone']} настроен и готов{Style.RESET_ALL}")
+        # Отключаем клиента после настройки, он будет подключен снова при запуске
+        await client.disconnect()
+        return True
+    
+    async def run_client(self, account_data):
+        """Запуск клиента с периодическим обновлением статуса online"""
+        client = None
+        try:
+            # Получаем данные аккаунта
+            name = account_data.get('name', 'Неизвестный')
+            phone = account_data.get('phone', 'Неизвестный')
+            session_file = account_data.get('session_file', f"telegram_session_{len(self.accounts) + 1}")
+            
+            logger.info(f"{Fore.CYAN}[{phone}] Запуск клиента {name}...{Style.RESET_ALL}")
+            
+            # Создаем клиента
+            client = self.create_client(session_file)
+            
+            # Если клиент не был создан, выходим
+            if not client:
+                logger.error(f"{Fore.RED}[{phone}] Не удалось создать клиента{Style.RESET_ALL}")
+                return
+            
+            # Сохраняем клиента в словаре для возможного доступа извне
+            self.clients[phone] = client
+            
+            # Настраиваем обработчик сообщений для этого клиента
+            client.add_event_handler(
+                lambda event: self.handle_new_message(client, event, phone),
+                events.NewMessage
+            )
+            
+            # Запускаем клиента и проверяем авторизацию
+            await client.connect()
+            
+            # Если клиент не авторизован, выполняем авторизацию
+            if not await client.is_user_authorized():
+                result = await self.authenticate_account(client, account_data)
+                if not result:
+                    logger.error(f"{Fore.RED}[{phone}] Не удалось авторизовать аккаунт{Style.RESET_ALL}")
+                    return
+            
+            # Получаем информацию о пользователе
+            me = await client.get_me()
+            logger.info(f"{Fore.GREEN}[{phone}] Авторизован как {me.first_name} {me.last_name if me.last_name else ''} (@{me.username if me.username else 'без username'}){Style.RESET_ALL}")
+            
+            # Загружаем диалоги для кэширования
+            await self.cache_dialogs(client, phone)
+            
+            # Запускаем цикл обновления статуса онлайн
+            while self.is_running:
+                try:
+                    # Убеждаемся, что клиент существует и подключен
+                    if client and client.is_connected():
+                        # Обновляем статус онлайн
+                        await client(functions.account.UpdateStatusRequest(offline=False))
+                        logger.info(f"{Fore.CYAN}[{phone}] Статус онлайн обновлен...{Style.RESET_ALL}")
+                    else:
+                        logger.warning(f"{Fore.YELLOW}[{phone}] Клиент не подключен, пропускаем обновление статуса{Style.RESET_ALL}")
+                        # Попытка переподключения
+                        try:
+                            await client.connect()
+                            logger.info(f"{Fore.GREEN}[{phone}] Клиент переподключен{Style.RESET_ALL}")
+                        except Exception as ce:
+                            logger.error(f"{Fore.RED}[{phone}] Ошибка переподключения клиента: {ce}{Style.RESET_ALL}")
+                        
+                    # Ждем некоторое время
+                    await asyncio.sleep(ONLINE_UPDATE_INTERVAL)
+                except Exception as e:
+                    logger.error(f"{Fore.RED}[{phone}] Ошибка обновления статуса: {e}{Style.RESET_ALL}")
+                    await asyncio.sleep(5)  # В случае ошибки подождем немного дольше
+            
+        except Exception as e:
+            logger.error(f"{Fore.RED}[{phone}] Критическая ошибка в работе клиента: {e}{Style.RESET_ALL}")
+        finally:
+            # При выходе из цикла отключаем клиент
+            if client:
+                try:
+                    await client.disconnect()
+                    logger.info(f"{Fore.YELLOW}[{phone}] Клиент отключен{Style.RESET_ALL}")
+                except Exception as e:
+                    logger.error(f"{Fore.RED}[{phone}] Ошибка отключения клиента: {e}{Style.RESET_ALL}")
+            
+            # Удаляем клиент из словаря
+            if 'phone' in locals() and phone in self.clients:
+                del self.clients[phone]
+    
+    async def authenticate_account(self, client, account_data):
+        """Аутентификация аккаунта."""
+        phone = account_data.get("phone", "Неизвестный")
+        
+        try:
+            # Если сессии нет, запрашиваем номер телефона и код
+            logger.info(f"{Fore.YELLOW}Запрашиваем авторизацию для аккаунта {account_data['name']}{Style.RESET_ALL}")
+            await client.start(phone=lambda: input(f'{Fore.YELLOW}Введите номер телефона для {account_data["name"]}: {Style.RESET_ALL}'))
+            logger.info(f"{Fore.GREEN}Авторизация успешна!{Style.RESET_ALL}")
+            
+            # Обновляем номер в данных аккаунта
+            actual_user = await client.get_me()
+            if hasattr(actual_user, 'phone'):
+                account_data['phone'] = actual_user.phone
+                self.save_accounts()
+                logger.info(f"{Fore.GREEN}Номер телефона обновлен: {account_data['phone']}{Style.RESET_ALL}")
+            return True
+        except Exception as e:
+            logger.error(f"{Fore.RED}Ошибка авторизации: {e}{Style.RESET_ALL}")
+            return False
+    
+    async def cache_dialogs(self, client, phone):
+        """Загрузка диалогов для кэширования сущностей."""
         try:
             logger.info(f"{Fore.YELLOW}[{phone}] Загрузка диалогов для кэширования...{Style.RESET_ALL}")
             await client(functions.messages.GetDialogsRequest(
@@ -168,211 +272,184 @@ class MultiAccountTelegramBot:
                 hash=0
             ))
             logger.info(f"{Fore.GREEN}[{phone}] Диалоги загружены успешно{Style.RESET_ALL}")
+            return True
         except Exception as e:
             logger.error(f"{Fore.RED}[{phone}] Ошибка загрузки диалогов: {e}{Style.RESET_ALL}")
-        
-        # Настраиваем обработчик сообщений для этого клиента
-        @client.on(events.NewMessage)
-        async def handler(event):
-            try:
-                if event.is_private:
-                    # Безопасно получаем ID чата/пользователя
-                    chat_id = event.chat_id
-                    
-                    # Пытаемся отметить сообщение как прочитанное безопасным способом
-                    try:
-                        # Получаем текст сообщения безопасно
-                        message_text = event.message.text if hasattr(event.message, 'text') else "[Медиа или не текстовое сообщение]"
-                        
-                        # Получаем информацию об отправителе безопасным способом
-                        try:
-                            sender = await event.get_sender()
-                            username = (
-                                getattr(sender, 'username', None) or 
-                                getattr(sender, 'phone', None) or 
-                                f"user_{utils.get_peer_id(sender) if hasattr(utils, 'get_peer_id') else chat_id}"
-                            )
-                        except Exception:
-                            username = f"user_{chat_id}"
-                            
-                        message_logger.info(f"{Fore.GREEN}[{phone}] Получено сообщение от {username}: {message_text}{Style.RESET_ALL}")
-                        
-                        # Метод 1: Стандартный API
-                        try:
-                            await client.send_read_acknowledge(chat_id)
-                            message_logger.info(f"{Fore.GREEN}[{phone}] Сообщение от {username} отмечено как прочитанное{Style.RESET_ALL}")
-                            return  # Если успешно, выходим из функции
-                        except Exception as e:
-                            # Если не сработал стандартный метод, пробуем альтернативы
-                            if "Could not find the input entity for" in str(e):
-                                pass  # Продолжаем к следующему методу
-                            else:
-                                logger.error(f"{Fore.YELLOW}[{phone}] Метод 1 не удался: {str(e)[:100]}{Style.RESET_ALL}")
-                        
-                        # Метод 2: Через сырой API запрос
-                        try:
-                            # Используем более низкоуровневый метод
-                            result = await client(functions.messages.ReadHistoryRequest(
-                                peer=chat_id,
-                                max_id=event.message.id
-                            ))
-                            message_logger.info(f"{Fore.GREEN}[{phone}] Сообщение от {username} отмечено как прочитанное (метод 2){Style.RESET_ALL}")
-                            return  # Если успешно, выходим из функции
-                        except Exception as e:
-                            logger.error(f"{Fore.YELLOW}[{phone}] Метод 2 не удался: {str(e)[:100]}{Style.RESET_ALL}")
-                        
-                        # Метод 3: Принудительное получение entity
-                        try:
-                            # Пытаемся получить entity через get_input_entity
-                            input_entity = await client.get_input_entity(chat_id)
-                            # Теперь пробуем отметить как прочитанное
-                            await client(functions.messages.ReadHistoryRequest(
-                                peer=input_entity,
-                                max_id=event.message.id
-                            ))
-                            message_logger.info(f"{Fore.GREEN}[{phone}] Сообщение от {username} отмечено как прочитанное (метод 3){Style.RESET_ALL}")
-                        except Exception as e:
-                            logger.error(f"{Fore.RED}[{phone}] Не удалось отметить сообщение: {str(e)[:100]}{Style.RESET_ALL}")
-                            # На этом этапе, если все методы не сработали, просто логируем ошибку
-                    except Exception as e:
-                        logger.error(f"{Fore.RED}[{phone}] Общая ошибка: {str(e)[:100]}{Style.RESET_ALL}")
-            except Exception as e:
-                logger.error(f"{Fore.RED}[{phone}] Ошибка обработки сообщения: {e}{Style.RESET_ALL}")
-        
-        logger.info(f"{Fore.GREEN}Клиент для {account_data['phone']} настроен и готов{Style.RESET_ALL}")
-        # Отключаем клиента после настройки, он будет подключен снова при запуске
-        await client.disconnect()
-        return True
+            return False
     
-    async def run_client(self, account_data):
-        """Запуск клиента с периодическим обновлением статуса online"""
-        session_file = account_data['session_file']
-        phone = account_data['phone']
-        
-        # Создаем клиента заново
-        client = self.create_client(session_file)
-        
+    async def handle_new_message(self, client, event, phone):
+        """Обработка новых сообщений."""
         try:
-            # Подключаемся и проверяем авторизацию
-            await client.connect()
-            if not await client.is_user_authorized():
-                logger.error(f"{Fore.RED}Клиент для {phone} не авторизован. Попробуйте перенастроить аккаунт.{Style.RESET_ALL}")
+            if not event.is_private:
+                return  # Игнорируем групповые сообщения
+                
+            # Получаем информацию о сообщении
+            chat = await event.get_chat()
+            sender = await event.get_sender()
+            
+            # Проверяем, является ли отправитель ботом
+            if hasattr(sender, 'bot') and sender.bot:
+                logger.info(f"{Fore.YELLOW}[{phone}] Сообщение от бота проигнорировано{Style.RESET_ALL}")
                 return
+                
+            # Проверяем, не является ли отправитель админом
+            if hasattr(sender, 'id') and sender.id == ADMIN_ID:
+                logger.info(f"{Fore.YELLOW}[{phone}] Сообщение от админа проигнорировано{Style.RESET_ALL}")
+                return
+
+            # Проверяем, не находится ли отправитель в списке игнорируемых
+            if hasattr(sender, 'id') and sender.id in IGNORED_USERS:
+                logger.info(f"{Fore.YELLOW}[{phone}] Сообщение от игнорируемого пользователя {sender.id} проигнорировано{Style.RESET_ALL}")
+                return
+                
+            # Получаем чат и информацию об отправителе
+            chat_id = chat.id
+            user_id = sender.id
+            user_first_name = getattr(sender, 'first_name', '')
+            user_last_name = getattr(sender, 'last_name', '')
+            username = getattr(sender, 'username', None)
             
-            self.clients[phone] = client
-            logger.info(f"{Fore.GREEN}Клиент для {phone} запущен успешно{Style.RESET_ALL}")
+            # Получаем текст сообщения и информацию о медиа
+            message_text = event.message.message or ""
+            media_type = None
             
-            # Загружаем последние диалоги для кэширования сущностей
-            try:
-                logger.info(f"{Fore.YELLOW}[{phone}] Загрузка диалогов для кэширования...{Style.RESET_ALL}")
-                await client(functions.messages.GetDialogsRequest(
-                    offset_date=None,
-                    offset_id=0,
-                    offset_peer=types.InputPeerEmpty(),
-                    limit=100,
-                    hash=0
-                ))
-                logger.info(f"{Fore.GREEN}[{phone}] Диалоги загружены успешно{Style.RESET_ALL}")
-            except Exception as e:
-                logger.error(f"{Fore.RED}[{phone}] Ошибка загрузки диалогов: {e}{Style.RESET_ALL}")
-            
-            # Настраиваем обработчик сообщений
-            @client.on(events.NewMessage)
-            async def handler(event):
-                try:
-                    if event.is_private:
-                        # Безопасно получаем ID чата/пользователя
-                        chat_id = event.chat_id
+            # Определяем тип медиа
+            if event.media:
+                if isinstance(event.media, types.MessageMediaPhoto):
+                    media_type = "📷 [Фото]"
+                elif isinstance(event.media, types.MessageMediaDocument):
+                    # Проверяем, является ли документ стикером
+                    if event.message.sticker:
+                        media_type = "📱 [Стикер]"
+                    # Проверяем mime-тип для определения типа медиа
+                    elif hasattr(event.media.document, 'mime_type'):
+                        mime_type = event.media.document.mime_type
+                        if 'video' in mime_type:
+                            media_type = "🎬 [Видео]"
+                        elif 'audio' in mime_type:
+                            media_type = "🎵 [Аудио]"
+                        elif 'image' in mime_type:
+                            media_type = "📷 [Изображение]"
+                        else:
+                            media_type = "📎 [Документ]"
+                    else:
+                        media_type = "📎 [Документ]"
+                else:
+                    media_type = "📱 [Медиа]"
                         
-                        # Пытаемся отметить сообщение как прочитанное безопасным способом
-                        try:
-                            # Получаем текст сообщения безопасно
-                            message_text = event.message.text if hasattr(event.message, 'text') else "[Медиа или не текстовое сообщение]"
-                            
-                            # Получаем информацию об отправителе безопасным способом
-                            try:
-                                sender = await event.get_sender()
-                                username = (
-                                    getattr(sender, 'username', None) or 
-                                    getattr(sender, 'phone', None) or 
-                                    f"user_{utils.get_peer_id(sender) if hasattr(utils, 'get_peer_id') else chat_id}"
-                                )
-                            except Exception:
-                                username = f"user_{chat_id}"
-                                
-                            message_logger.info(f"{Fore.GREEN}[{phone}] Получено сообщение от {username}: {message_text}{Style.RESET_ALL}")
-                            
-                            # Метод 1: Стандартный API
-                            try:
-                                await client.send_read_acknowledge(chat_id)
-                                message_logger.info(f"{Fore.GREEN}[{phone}] Сообщение от {username} отмечено как прочитанное{Style.RESET_ALL}")
-                                return  # Если успешно, выходим из функции
-                            except Exception as e:
-                                # Если не сработал стандартный метод, пробуем альтернативы
-                                if "Could not find the input entity for" in str(e):
-                                    pass  # Продолжаем к следующему методу
-                                else:
-                                    logger.error(f"{Fore.YELLOW}[{phone}] Метод 1 не удался: {str(e)[:100]}{Style.RESET_ALL}")
-                            
-                            # Метод 2: Через сырой API запрос
-                            try:
-                                # Используем более низкоуровневый метод
-                                result = await client(functions.messages.ReadHistoryRequest(
-                                    peer=chat_id,
-                                    max_id=event.message.id
-                                ))
-                                message_logger.info(f"{Fore.GREEN}[{phone}] Сообщение от {username} отмечено как прочитанное (метод 2){Style.RESET_ALL}")
-                                return  # Если успешно, выходим из функции
-                            except Exception as e:
-                                logger.error(f"{Fore.YELLOW}[{phone}] Метод 2 не удался: {str(e)[:100]}{Style.RESET_ALL}")
-                            
-                            # Метод 3: Принудительное получение entity
-                            try:
-                                # Пытаемся получить entity через get_input_entity
-                                input_entity = await client.get_input_entity(chat_id)
-                                # Теперь пробуем отметить как прочитанное
-                                await client(functions.messages.ReadHistoryRequest(
-                                    peer=input_entity,
-                                    max_id=event.message.id
-                                ))
-                                message_logger.info(f"{Fore.GREEN}[{phone}] Сообщение от {username} отмечено как прочитанное (метод 3){Style.RESET_ALL}")
-                            except Exception as e:
-                                logger.error(f"{Fore.RED}[{phone}] Не удалось отметить сообщение: {str(e)[:100]}{Style.RESET_ALL}")
-                                # На этом этапе, если все методы не сработали, просто логируем ошибку
-                        except Exception as e:
-                            logger.error(f"{Fore.RED}[{phone}] Общая ошибка: {str(e)[:100]}{Style.RESET_ALL}")
-                except Exception as e:
-                    logger.error(f"{Fore.RED}[{phone}] Ошибка обработки сообщения: {e}{Style.RESET_ALL}")
+            # Формируем строку для логирования
+            user_display = f"@{username}" if username else f"{user_first_name} {user_last_name}".strip()
+            log_message = f"{Fore.CYAN}[{phone}] Новое сообщение от {user_display}: {message_text}"
+            if media_type:
+                log_message += f" {media_type}"
+            log_message += Style.RESET_ALL
             
-            # Запускаем цикл обновления статуса
-            while self.is_running:
+            # Логируем сообщение
+            message_logger.info(log_message)
+            
+            # Отметка сообщения как прочитанного
+            try:
+                # Метод 1: Стандартный API
                 try:
-                    # Обновляем статус онлайн
-                    await client(functions.account.UpdateStatusRequest(offline=False))
-                    logger.info(f"{Fore.CYAN}[{phone}] Статус онлайн обновлен...{Style.RESET_ALL}")
-                    
-                    # Ждем некоторое время (3 секунды)
-                    await asyncio.sleep(ONLINE_UPDATE_INTERVAL)
+                    await client.send_read_acknowledge(chat_id)
+                    message_logger.info(f"{Fore.GREEN}[{phone}] Сообщение от {username if username else user_display} отмечено как прочитанное{Style.RESET_ALL}")
                 except Exception as e:
-                    logger.error(f"{Fore.RED}[{phone}] Ошибка обновления статуса: {e}{Style.RESET_ALL}")
-                    await asyncio.sleep(5)  # В случае ошибки подождем немного дольше
+                    # Если не сработал стандартный метод, пробуем альтернативы
+                    logger.error(f"{Fore.YELLOW}[{phone}] Метод 1 не удался: {str(e)}{Style.RESET_ALL}")
+                    
+                    # Метод 2: Через сырой API запрос
+                    try:
+                        # Используем более низкоуровневый метод
+                        result = await client(functions.messages.ReadHistoryRequest(
+                            peer=chat_id,
+                            max_id=event.message.id
+                        ))
+                        message_logger.info(f"{Fore.GREEN}[{phone}] Сообщение от {username if username else user_display} отмечено как прочитанное (метод 2){Style.RESET_ALL}")
+                    except Exception as e:
+                        logger.error(f"{Fore.RED}[{phone}] Не удалось отметить сообщение как прочитанное: {str(e)}{Style.RESET_ALL}")
+            except Exception as e:
+                logger.error(f"{Fore.RED}[{phone}] Общая ошибка отметки сообщения: {str(e)}{Style.RESET_ALL}")
             
-        finally:
-            # При выходе из цикла отключаем клиент
-            await client.disconnect()
-            logger.info(f"{Fore.YELLOW}[{phone}] Клиент отключен{Style.RESET_ALL}")
+            # Теперь ВСЕ сообщения (и текстовые, и медиа) отправляются ТОЛЬКО через бота
+            if hasattr(self, 'notification_bot') and self.notification_bot:
+                try:
+                    # Убедимся, что событие имеет доступ к клиенту для пересылки
+                    # Записываем клиент в атрибут события для пересылки медиа
+                    if not hasattr(event, 'client'):
+                        event._client = client
+                        
+                    # Подготовка текста сообщения
+                    notification_text = message_text
+                    
+                    logger.info(f"{Fore.YELLOW}[{phone}] Отправляю сообщение через бота...{Style.RESET_ALL}")
+                    
+                    # Отправка сообщения через бота
+                    asyncio.create_task(
+                        self.notification_bot.send_notification(sender, notification_text, event=event)
+                    )
+                except Exception as e:
+                    logger.error(f"{Fore.RED}[{phone}] Ошибка отправки сообщения через бота: {str(e)}{Style.RESET_ALL}")
+            else:
+                logger.warning(f"{Fore.YELLOW}[{phone}] Бот уведомлений не запущен, сообщение не отправлено{Style.RESET_ALL}")
+            
+            logger.info(f"{Fore.GREEN}[{phone}] Сообщение обработано{Style.RESET_ALL}")
+                
+        except Exception as e:
+            logger.error(f"{Fore.RED}[{phone}] Ошибка обработки сообщения: {str(e)[:100]}{Style.RESET_ALL}")
     
     async def start_all_clients(self):
         """Запуск всех клиентов"""
-        tasks = []
-        for account_data in self.accounts:
-            tasks.append(self.run_client(account_data))
+        # Запускаем бота для уведомлений
+        try:
+            # Запускаем бота для уведомлений в отдельной задаче
+            notification_task = asyncio.create_task(self.start_notification_bot())
+            logger.info(f"{Fore.GREEN}Бот уведомлений запущен{Style.RESET_ALL}")
+        except Exception as e:
+            logger.error(f"{Fore.RED}Ошибка запуска бота уведомлений: {e}{Style.RESET_ALL}")
         
-        await asyncio.gather(*tasks)
+        # Запускаем клиенты для всех аккаунтов
+        tasks = []
+        for account in self.accounts:
+            task = asyncio.create_task(self.run_client(account))
+            tasks.append(task)
+        
+        # Ожидаем завершения всех задач
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            logger.info(f"{Fore.YELLOW}Задачи клиентов отменены{Style.RESET_ALL}")
+        except Exception as e:
+            logger.error(f"{Fore.RED}Ошибка при выполнении задач клиентов: {e}{Style.RESET_ALL}")
+        
+        # Останавливаем бота уведомлений
+        try:
+            await self.stop_notification_bot()
+            logger.info(f"{Fore.YELLOW}Бот уведомлений остановлен{Style.RESET_ALL}")
+        except Exception as e:
+            logger.error(f"{Fore.RED}Ошибка остановки бота уведомлений: {e}{Style.RESET_ALL}")
     
-    async def authenticate_account(self, account_data):
-        """Выполняет авторизацию для аккаунта"""
-        return await self.setup_client(account_data)
+    async def start_notification_bot(self):
+        """Запуск бота для уведомлений"""
+        try:
+            from notification_bot import NotificationBot
+            self.notification_bot = NotificationBot()
+            await self.notification_bot.start()
+            logger.info(f"{Fore.GREEN}Бот уведомлений запущен{Style.RESET_ALL}")
+            return True
+        except Exception as e:
+            logger.error(f"{Fore.RED}Ошибка запуска бота уведомлений: {e}{Style.RESET_ALL}")
+            self.notification_bot = None  # Обнуляем при ошибке
+            return False
+
+    async def stop_notification_bot(self):
+        """Остановка бота для уведомлений"""
+        try:
+            if hasattr(self, 'notification_bot') and self.notification_bot:
+                await self.notification_bot.stop()
+                self.notification_bot = None  # Обнуляем после остановки
+                logger.info(f"{Fore.GREEN}Бот уведомлений остановлен{Style.RESET_ALL}")
+        except Exception as e:
+            logger.error(f"{Fore.RED}Ошибка остановки бота уведомлений: {e}{Style.RESET_ALL}")
     
     def add_account(self):
         """Добавление нового аккаунта с немедленной авторизацией"""
@@ -396,7 +473,7 @@ class MultiAccountTelegramBot:
         print(f"{Fore.YELLOW}Выполняем авторизацию для аккаунта {account_name}...{Style.RESET_ALL}")
         
         # Выполняем авторизацию
-        success = self.loop.run_until_complete(self.authenticate_account(account_data))
+        success = self.loop.run_until_complete(self.authenticate_account(self.clients[account_data['phone']], account_data))
         
         if success:
             print(f"{Fore.GREEN}Аккаунт {account_name} успешно добавлен и авторизован{Style.RESET_ALL}")
